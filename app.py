@@ -1,455 +1,388 @@
-import streamlit as st
-import requests
-from pathlib import Path
-from datetime import datetime
-from typing import List, Tuple, Optional, Dict, Any
+from __future__ import annotations
+
+import json
+import math
 import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
-import chromadb
-from chromadb.config import Settings
-from sentence_transformers import SentenceTransformer
+import requests
+from flask import Flask, jsonify, request, send_from_directory
 from pypdf import PdfReader
+from werkzeug.utils import secure_filename
 
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-# =========================
-#        SETTINGS
-# =========================
-MODEL = "phi3:mini"
-
-# Use /api/generate (works on more Ollama installs than /api/chat)
-OLLAMA_GENERATE_URL = "http://localhost:11434/api/generate"
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "data" / "uploads"
-CHROMA_DIR = BASE_DIR / "data" / "chroma"
+DATA_DIR = BASE_DIR / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
+INDEX_PATH = DATA_DIR / "index.json"
 
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "llama3.2:3b")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+DEFAULT_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", "900"))
+DEFAULT_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", "180"))
+
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md"}
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
-st.set_page_config(page_title="ClauseGraph RAG", layout="wide")
-
-
-# =========================
-#        HELPERS
-# =========================
-def read_txt(path: Path) -> str:
-    return path.read_text(errors="ignore")
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024
 
 
-def read_pdf(path: Path) -> str:
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_index() -> dict[str, Any]:
+    if not INDEX_PATH.exists():
+        return {"documents": {}, "chunks": []}
+
+    with INDEX_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def save_index(store: dict[str, Any]) -> None:
+    with INDEX_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(store, handle, ensure_ascii=True, indent=2)
+
+
+def read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def read_pdf_file(path: Path) -> str:
     reader = PdfReader(str(path))
-    pages = []
-    for p in reader.pages:
-        pages.append(p.extract_text() or "")
+    pages: list[str] = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
     return "\n".join(pages)
 
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> List[str]:
-    text = " ".join(text.split())  # normalize whitespace
-    chunks = []
+def read_document(path: Path) -> str:
+    if path.suffix.lower() == ".pdf":
+        return read_pdf_file(path)
+    return read_text_file(path)
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    normalized = normalize_text(text)
+    if not normalized:
+        return []
+
+    chunks: list[str] = []
     start = 0
-    while start < len(text):
-        end = min(len(text), start + chunk_size)
-        chunks.append(text[start:end])
-        if end == len(text):
+    length = len(normalized)
+
+    while start < length:
+        end = min(length, start + chunk_size)
+        if end < length:
+            boundary = normalized.rfind(" ", start + int(chunk_size * 0.6), end)
+            if boundary > start:
+                end = boundary
+
+        chunk = normalized[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= length:
             break
-        start = max(0, end - overlap)
+
+        next_start = max(0, end - overlap)
+        if next_start <= start:
+            next_start = end
+        start = next_start
+
     return chunks
 
 
-@st.cache_resource
-def get_embedder():
-    # Small + fast embedding model
-    return SentenceTransformer("intfloat/e5-small-v2")
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    denominator = left_norm * right_norm
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
 
 
-def get_chroma_collection():
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR),
-        settings=Settings(anonymized_telemetry=False),
+def ollama_tags() -> dict[str, Any]:
+    response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def ollama_embed(texts: list[str]) -> list[list[float]]:
+    response = requests.post(
+        f"{OLLAMA_BASE_URL}/api/embed",
+        json={"model": OLLAMA_EMBED_MODEL, "input": texts},
+        timeout=180,
     )
-    return client.get_or_create_collection("clausegraph")
+
+    if response.ok:
+        payload = response.json()
+        embeddings = payload.get("embeddings")
+        if embeddings:
+            return embeddings
+
+    fallback_embeddings: list[list[float]] = []
+    for text in texts:
+        fallback = requests.post(
+            f"{OLLAMA_BASE_URL}/api/embeddings",
+            json={"model": OLLAMA_EMBED_MODEL, "prompt": text},
+            timeout=180,
+        )
+        fallback.raise_for_status()
+        fallback_embeddings.append(fallback.json()["embedding"])
+
+    return fallback_embeddings
 
 
-def list_uploaded_files() -> List[str]:
-    return sorted([p.name for p in UPLOAD_DIR.glob("*")], reverse=True)
+def ollama_generate(prompt: str) -> str:
+    response = requests.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={"model": OLLAMA_CHAT_MODEL, "prompt": prompt, "stream": False},
+        timeout=180,
+    )
+    response.raise_for_status()
+    return (response.json().get("response") or "").strip()
 
 
-def delete_file_and_vectors(filename: str) -> None:
-    # delete vectors
-    collection = get_chroma_collection()
-    collection.delete(where={"source": filename})
+def build_prompt(question: str, contexts: list[dict[str, Any]]) -> str:
+    context_text = "\n\n".join(
+        f"[{item['source_label']}] {item['text']}" for item in contexts
+    )
+    return (
+        "You are a document question-answering assistant.\n"
+        "Answer only from the provided context.\n"
+        "If the answer is not supported by the context, say: "
+        "'I do not know from the indexed documents.'\n"
+        "End with a short 'Sources:' line using the provided source labels.\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Question: {question}\n"
+        "Answer:"
+    )
 
-    # delete file
-    fp = UPLOAD_DIR / filename
-    if fp.exists():
-        fp.unlink()
+
+def unique_upload_path(filename: str) -> Path:
+    candidate = UPLOAD_DIR / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 1
+    while True:
+        next_candidate = UPLOAD_DIR / f"{stem}-{counter}{suffix}"
+        if not next_candidate.exists():
+            return next_candidate
+        counter += 1
 
 
-def clear_vectors_for_file(filename: str) -> None:
-    collection = get_chroma_collection()
-    collection.delete(where={"source": filename})
+def document_summary(filename: str, store: dict[str, Any]) -> dict[str, Any]:
+    path = UPLOAD_DIR / filename
+    metadata = store["documents"].get(filename, {})
+    chunk_count = sum(1 for chunk in store["chunks"] if chunk["filename"] == filename)
+    return {
+        "filename": filename,
+        "size_bytes": path.stat().st_size if path.exists() else 0,
+        "indexed_chunks": chunk_count,
+        "updated_at": metadata.get("updated_at"),
+    }
 
 
-def index_file(filename: str, chunk_size: int, overlap: int) -> int:
+def index_document(filename: str, chunk_size: int, overlap: int, store: dict[str, Any]) -> dict[str, Any]:
     path = UPLOAD_DIR / filename
     if not path.exists():
-        return 0
+        raise FileNotFoundError(f"{filename} does not exist")
 
-    if path.suffix.lower() == ".pdf":
-        text = read_pdf(path)
-    else:
-        text = read_txt(path)
+    raw_text = read_document(path)
+    chunks = chunk_text(raw_text, chunk_size=chunk_size, overlap=overlap)
+    embeddings = ollama_embed(chunks) if chunks else []
 
-    if not text.strip():
-        return 0
+    store["chunks"] = [chunk for chunk in store["chunks"] if chunk["filename"] != filename]
 
-    chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    for index, (text, embedding) in enumerate(zip(chunks, embeddings)):
+        store["chunks"].append(
+            {
+                "id": f"{filename}::chunk::{index}",
+                "filename": filename,
+                "chunk_index": index,
+                "text": text,
+                "embedding": embedding,
+                "source_label": f"{filename}#chunk-{index}",
+            }
+        )
 
-    embedder = get_embedder()
-    collection = get_chroma_collection()
+    store["documents"][filename] = {
+        "updated_at": utc_now(),
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "chunk_count": len(chunks),
+    }
 
-    # Remove previous vectors for this file (clean re-index)
-    collection.delete(where={"source": filename})
-
-    # Stable IDs (no timestamp) so re-index is predictable
-    ids = [f"{filename}::chunk::{i}" for i in range(len(chunks))]
-
-    # E5 prefers passage/query prefixes
-    embeddings = embedder.encode(
-        [f"passage: {c}" for c in chunks],
-        normalize_embeddings=True
-    ).tolist()
-
-    metadatas = [{"source": filename, "chunk_index": i} for i in range(len(chunks))]
-
-    collection.upsert(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadatas)
-    return len(chunks)
+    save_index(store)
+    return document_summary(filename, store)
 
 
-def chroma_vector_retrieve(query: str, top_k: int, scope_filename: Optional[str]) -> List[Dict[str, Any]]:
-    embedder = get_embedder()
-    collection = get_chroma_collection()
+def retrieve_chunks(question: str, top_k: int, filename: str | None, store: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates = store["chunks"]
+    if filename:
+        candidates = [chunk for chunk in candidates if chunk["filename"] == filename]
 
-    try:
-        if collection.count() == 0:
-            return []
-    except Exception:
-        pass
-
-    q_emb = embedder.encode([f"query: {query}"], normalize_embeddings=True).tolist()[0]
-    where = {"source": scope_filename} if scope_filename else None
-
-    results = collection.query(
-        query_embeddings=[q_emb],
-        n_results=top_k,
-        where=where,
-        include=["documents", "metadatas", "distances"],
-    )
-
-    if not results or not results.get("documents") or not results["documents"][0]:
+    if not candidates:
         return []
 
-    out = []
-    for i in range(len(results["documents"][0])):
-        out.append({
-            "id": results["ids"][0][i],
-            "doc": results["documents"][0][i],
-            "meta": results["metadatas"][0][i] if results.get("metadatas") else {},
-            "distance": results["distances"][0][i] if results.get("distances") else None,
-            "source": "vector",
-        })
-    return out
+    query_embedding = ollama_embed([question])[0]
+    ranked = []
+    for chunk in candidates:
+        score = cosine_similarity(query_embedding, chunk["embedding"])
+        ranked.append({**chunk, "score": score})
 
-
-@st.cache_data(show_spinner=False)
-def build_tfidf_index(docs: List[str]):
-    vectorizer = TfidfVectorizer(stop_words="english")
-    X = vectorizer.fit_transform(docs) if docs else None
-    return vectorizer, X
-
-
-def keyword_retrieve(query: str, top_k: int, scope_filename: Optional[str]) -> List[Dict[str, Any]]:
-    collection = get_chroma_collection()
-    where = {"source": scope_filename} if scope_filename else None
-
-    got = collection.get(where=where, include=["documents", "metadatas"])
-
-    docs = got.get("documents") or []
-    metas = got.get("metadatas") or []
-    ids = got.get("ids") or []
-
-    if not docs:
-        return []
-
-    vectorizer, X = build_tfidf_index(docs)
-    if X is None:
-        return []
-
-    q = vectorizer.transform([query])
-    sims = cosine_similarity(q, X).flatten()
-
-    top_idx = sims.argsort()[::-1][:top_k]
-
-    out = []
-    for i in top_idx:
-        if sims[i] <= 0:
-            continue
-        out.append({
-            "id": ids[i],
-            "doc": docs[i],
-            "meta": metas[i] if i < len(metas) else {},
-            "kw_score": float(sims[i]),
-            "source": "keyword",
-        })
-    return out
-
-
-def hybrid_retrieve(query: str, top_k: int, scope_filename: Optional[str]) -> List[Dict[str, Any]]:
-    vec_hits = chroma_vector_retrieve(query, top_k=top_k, scope_filename=scope_filename)
-    kw_hits = keyword_retrieve(query, top_k=top_k, scope_filename=scope_filename)
-
-    merged: Dict[str, Dict[str, Any]] = {}
-
-    for h in vec_hits:
-        merged[h["id"]] = h
-
-    for h in kw_hits:
-        if h["id"] in merged:
-            merged[h["id"]]["kw_score"] = h.get("kw_score")
-            merged[h["id"]]["source"] = "hybrid"
-        else:
-            merged[h["id"]] = h
-
-    def rank_key(item: Dict[str, Any]):
-        src = item.get("source", "")
-        hybrid_bonus = 1 if src == "hybrid" else 0
-        kw = item.get("kw_score", 0.0) or 0.0
-        dist = item.get("distance", 999.0) if item.get("distance") is not None else 999.0
-        return (hybrid_bonus, kw, -dist)
-
-    ranked = sorted(merged.values(), key=rank_key, reverse=True)
+    ranked.sort(key=lambda item: item["score"], reverse=True)
     return ranked[:top_k]
 
 
-def answer_with_context(question: str, context_blocks: List[str], stream: bool = False) -> str:
-    system = (
-        "You are a helpful assistant. Use ONLY the provided CONTEXT to answer.\n"
-        "If the answer is not in the context, say: 'I don't know from the provided documents.'\n"
-        "Always include a short Sources section listing the chunk IDs you used."
-    )
-
-    context_text = "\n\n".join(context_blocks)
-
-    prompt = (
-        f"SYSTEM:\n{system}\n\n"
-        f"CONTEXT:\n{context_text}\n\n"
-        f"QUESTION:\n{question}\n"
-    )
-
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": stream,
-    }
-
-    if not stream:
-        resp = requests.post(OLLAMA_GENERATE_URL, json=payload, timeout=180)
-        resp.raise_for_status()
-        data = resp.json()
-        return (data.get("response") or "").strip()
-
-    # Streaming: JSON-lines with "response"
-    resp = requests.post(OLLAMA_GENERATE_URL, json=payload, stream=True, timeout=180)
-    resp.raise_for_status()
-
-    full = ""
-    for line in resp.iter_lines():
-        if not line:
-            continue
-        try:
-            obj = __import__("json").loads(line.decode("utf-8"))
-            full += obj.get("response", "")
-        except Exception:
-            continue
-    return full.strip()
+@app.get("/")
+def serve_index() -> Any:
+    return send_from_directory(BASE_DIR, "index.html")
 
 
-# =========================
-#   SIDEBAR: CONTROLS
-# =========================
-st.sidebar.header("📄 Documents")
-st.sidebar.caption(f"Uploads folder:\n{UPLOAD_DIR}")
+@app.get("/api/health")
+def health() -> Any:
+    try:
+        tags = ollama_tags()
+        return jsonify(
+            {
+                "ok": True,
+                "ollama_base_url": OLLAMA_BASE_URL,
+                "chat_model": OLLAMA_CHAT_MODEL,
+                "embed_model": OLLAMA_EMBED_MODEL,
+                "available_models": [item["name"] for item in tags.get("models", [])],
+            }
+        )
+    except Exception as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "ollama_base_url": OLLAMA_BASE_URL,
+                "chat_model": OLLAMA_CHAT_MODEL,
+                "embed_model": OLLAMA_EMBED_MODEL,
+                "error": str(exc),
+            }
+        ), 503
 
-uploaded = st.sidebar.file_uploader("Upload a PDF or TXT", type=["pdf", "txt"])
 
-# Save upload only once (prevents rerun loops)
-if "last_saved_name" not in st.session_state:
-    st.session_state.last_saved_name = None
+@app.get("/api/documents")
+def list_documents() -> Any:
+    store = load_index()
+    filenames = sorted(path.name for path in UPLOAD_DIR.iterdir() if path.is_file())
+    return jsonify({"documents": [document_summary(name, store) for name in filenames]})
 
-if uploaded is not None:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = uploaded.name.replace(" ", "_")
-    save_name = f"{timestamp}_{safe_name}"
-    save_path = UPLOAD_DIR / save_name
 
-    if st.session_state.last_saved_name != save_name:
-        with open(save_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-        st.session_state.last_saved_name = save_name
-        st.sidebar.success(f"Saved: {save_path.name}")
-        st.rerun()
-
-st.sidebar.subheader("Saved files")
-collection = get_chroma_collection()
-try:
-    st.sidebar.caption(f"Indexed chunks in DB: {collection.count()}")
-except Exception:
-    st.sidebar.caption("Indexed chunks in DB: (unknown)")
-
-files = list_uploaded_files()
-if not files:
-    st.sidebar.caption("No files uploaded yet.")
-    selected_file: Optional[str] = None
-else:
-    selected_file = st.sidebar.selectbox("Choose a file", files)
-
-colA, colB = st.sidebar.columns(2)
-
-if colA.button("🗑️ Delete file", use_container_width=True):
-    if not selected_file:
-        st.sidebar.warning("Select a file first.")
-    else:
-        delete_file_and_vectors(selected_file)
-        st.session_state.messages = []
-        st.sidebar.success("Deleted file + vectors.")
-        st.rerun()
-
-if colB.button("🧽 Clear vectors", use_container_width=True):
-    if not selected_file:
-        st.sidebar.warning("Select a file first.")
-    else:
-        clear_vectors_for_file(selected_file)
-        st.sidebar.success("Cleared vectors for that file.")
-        st.rerun()
-
-st.sidebar.divider()
-
-st.sidebar.subheader("Indexing")
-chunk_size = st.sidebar.slider("Chunk size", 400, 1600, 900, 100)
-overlap = st.sidebar.slider("Overlap", 0, 400, 120, 10)
-
-if st.sidebar.button("⚡ Index selected file", use_container_width=True):
-    if not selected_file:
-        st.sidebar.warning("Select a file first.")
-    else:
-        try:
-            with st.spinner("Indexing... (first time may take a minute)"):
-                n = index_file(selected_file, chunk_size=chunk_size, overlap=overlap)
-            if n == 0:
-                st.sidebar.error("No text found (empty/unreadable). Try a TXT file first.")
-            else:
-                st.sidebar.success(f"Indexed {n} chunks.")
-                st.rerun()
-        except Exception as e:
-            st.sidebar.error("Indexing failed:")
-            st.sidebar.exception(e)
-
-if st.sidebar.button("⚡ Index ALL files", use_container_width=True):
+@app.post("/api/upload")
+def upload_documents() -> Any:
+    files = request.files.getlist("files")
     if not files:
-        st.sidebar.warning("Upload files first.")
+        return jsonify({"error": "No files were uploaded."}), 400
+
+    saved: list[dict[str, Any]] = []
+    for incoming in files:
+        original_name = secure_filename(incoming.filename or "")
+        if not original_name:
+            continue
+
+        suffix = Path(original_name).suffix.lower()
+        if suffix not in ALLOWED_EXTENSIONS:
+            return jsonify({"error": f"Unsupported file type: {suffix}"}), 400
+
+        target = unique_upload_path(original_name)
+        incoming.save(target)
+        saved.append({"filename": target.name, "size_bytes": target.stat().st_size})
+
+    if not saved:
+        return jsonify({"error": "No valid files were uploaded."}), 400
+
+    return jsonify({"uploaded": saved}), 201
+
+
+@app.post("/api/index")
+def index_documents() -> Any:
+    payload = request.get_json(silent=True) or {}
+    filename = payload.get("filename")
+    chunk_size = int(payload.get("chunk_size") or DEFAULT_CHUNK_SIZE)
+    overlap = int(payload.get("overlap") or DEFAULT_CHUNK_OVERLAP)
+
+    if overlap >= chunk_size:
+        return jsonify({"error": "Overlap must be smaller than chunk size."}), 400
+
+    if filename:
+        filenames = [filename]
     else:
-        total = 0
-        try:
-            with st.spinner("Indexing ALL files..."):
-                for fn in files:
-                    total += index_file(fn, chunk_size=chunk_size, overlap=overlap)
-            st.sidebar.success(f"Indexed total chunks: {total}")
-            st.rerun()
-        except Exception as e:
-            st.sidebar.error("Indexing ALL failed:")
-            st.sidebar.exception(e)
+        filenames = sorted(path.name for path in UPLOAD_DIR.iterdir() if path.is_file())
 
-st.sidebar.divider()
+    if not filenames:
+        return jsonify({"error": "No uploaded files found to index."}), 400
 
-st.sidebar.subheader("Retrieval")
-scope = st.sidebar.radio("Search scope", ["All files", "Selected file only"])
-use_hybrid = st.sidebar.toggle("Hybrid retrieval (Vector + Keyword)", value=True)
-top_k = st.sidebar.slider("Top-K chunks", 2, 12, 5, 1)
-show_chunks = st.sidebar.toggle("Show retrieved chunks", value=True)
-stream_answer = st.sidebar.toggle("Stream answer", value=False)
+    store = load_index()
+    indexed = []
+    for name in filenames:
+        indexed.append(index_document(name, chunk_size, overlap, store))
 
-st.sidebar.divider()
-if st.sidebar.button("🧹 Clear chat", use_container_width=True):
-    st.session_state.messages = []
-    st.rerun()
+    return jsonify({"indexed": indexed})
 
 
-# =========================
-#        MAIN UI
-# =========================
-st.title("🧠 ClauseGraph RAG (Local AI)")
-st.caption("Advanced RAG: upload → index → ask questions with sources. Now with delete + hybrid search.")
+@app.post("/api/query")
+def query_documents() -> Any:
+    payload = request.get_json(silent=True) or {}
+    question = (payload.get("question") or "").strip()
+    filename = payload.get("filename") or None
+    top_k = int(payload.get("top_k") or 4)
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    if not question:
+        return jsonify({"error": "Question is required."}), 400
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    store = load_index()
+    matches = retrieve_chunks(question, top_k=top_k, filename=filename, store=store)
+    if not matches:
+        return jsonify({"answer": "I do not know from the indexed documents.", "sources": []})
 
-effective_scope_file = selected_file if (scope == "Selected file only") else None
+    answer = ollama_generate(build_prompt(question, matches))
+    sources = [
+        {
+            "id": item["id"],
+            "filename": item["filename"],
+            "chunk_index": item["chunk_index"],
+            "score": round(item["score"], 4),
+            "text": item["text"],
+            "source_label": item["source_label"],
+        }
+        for item in matches
+    ]
+    return jsonify({"answer": answer, "sources": sources})
 
-if prompt := st.chat_input("Ask something about your documents..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Retrieving..."):
-            hits = (
-                hybrid_retrieve(prompt, top_k=top_k, scope_filename=effective_scope_file)
-                if use_hybrid
-                else chroma_vector_retrieve(prompt, top_k=top_k, scope_filename=effective_scope_file)
-            )
+@app.delete("/api/documents/<path:filename>")
+def delete_document(filename: str) -> Any:
+    path = UPLOAD_DIR / filename
+    store = load_index()
 
-        if not hits:
-            st.markdown("I don't know from the provided documents. (Index a file first.)")
-            st.session_state.messages.append({"role": "assistant", "content": "I don't know from the provided documents. (Index a file first.)"})
-        else:
-            context_blocks = []
-            used_ids = []
-            for h in hits:
-                cid = h["id"]
-                doc = h["doc"]
-                used_ids.append(cid)
-                context_blocks.append(f"[{cid}] {doc}")
+    if path.exists():
+        path.unlink()
 
-            with st.spinner("Answering..."):
-                try:
-                    reply = answer_with_context(prompt, context_blocks, stream=stream_answer)
-                except Exception as e:
-                    st.error("Ollama call failed. Make sure Ollama is running and the model is pulled.")
-                    st.exception(e)
-                    reply = ""
+    store["chunks"] = [chunk for chunk in store["chunks"] if chunk["filename"] != filename]
+    store["documents"].pop(filename, None)
+    save_index(store)
+    return jsonify({"deleted": filename})
 
-            if reply:
-                st.markdown(reply)
-                st.caption("Sources: " + ", ".join(used_ids[:6]) + ("..." if len(used_ids) > 6 else ""))
 
-                if show_chunks:
-                    with st.expander("Sources (retrieved chunks)"):
-                        for h in hits:
-                            meta = h.get("meta") or {}
-                            st.markdown(f"**{h['id']}**  \n*{meta.get('source','')} — chunk {meta.get('chunk_index','')}*")
-                            st.caption(
-                                f"retrieval: {h.get('source')} | "
-                                f"kw_score={h.get('kw_score', '')} | "
-                                f"distance={h.get('distance', '')}"
-                            )
-                            st.write(h["doc"][:500] + ("..." if len(h["doc"]) > 500 else ""))
-                            st.divider()
-
-                st.session_state.messages.append({"role": "assistant", "content": reply})
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")), debug=True)
